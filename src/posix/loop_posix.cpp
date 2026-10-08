@@ -1,7 +1,8 @@
 // POSIX event loop: poll() over a Unix-socket listener, its connections and
 // a self-pipe for wake(). A `<socket>.lock` file held with flock() decides
 // which server owns the address, so a stale socket left by a crashed server
-// is reclaimed and two servers never fight over one.
+// is reclaimed and two servers never fight over one. A server removes both
+// files when it goes; a crashed one leaves them for the next to reclaim.
 #include "brolink/loop.h"
 #include "posix_util.h"
 
@@ -42,7 +43,13 @@ public:
         close_listener();
         for (auto& [id, c] : conns_) ::close(c->fd);
         conns_.clear();
-        if (lock_fd_ >= 0) ::close(lock_fd_);
+        if (lock_fd_ >= 0) {
+            // Still holding the lock, so the file is ours to remove. One
+            // opened by a server starting meanwhile is rejected there
+            // (listen() checks the lock it takes is on the file at the path).
+            ::unlink(lock_path_.c_str());
+            ::close(lock_fd_);
+        }
         if (wake_r_ >= 0) ::close(wake_r_);
         if (wake_w_ >= 0) ::close(wake_w_);
     }
@@ -56,20 +63,37 @@ public:
             return false;
         }
         std::memcpy(sa.sun_path, address.c_str(), address.size() + 1);
-        // Ownership of the address: whoever holds the lock.
+        // Ownership of the address: whoever holds the lock. The owner removes
+        // the lock file when it goes, so a lock taken on a file that has
+        // since been unlinked (opened just before its owner removed it) owns
+        // nothing: the lock only counts while it is on the file at the path.
         const std::string lock_path = address + ".lock";
-        lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-        if (lock_fd_ < 0) {
-            err = "cannot open " + lock_path + ": " + posix::errno_text(errno);
-            return false;
-        }
-        if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-            err = "another server owns " + address;
-            in_use = true;
+        for (int attempt = 0;; ++attempt) {
+            lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+            if (lock_fd_ < 0) {
+                err = "cannot open " + lock_path + ": " + posix::errno_text(errno);
+                return false;
+            }
+            if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+                err = "another server owns " + address;
+                in_use = true;
+                ::close(lock_fd_);
+                lock_fd_ = -1;
+                return false;
+            }
+            struct stat held{}, named{};
+            if (::fstat(lock_fd_, &held) == 0 && ::stat(lock_path.c_str(), &named) == 0 &&
+                held.st_dev == named.st_dev && held.st_ino == named.st_ino) {
+                break;
+            }
             ::close(lock_fd_);
             lock_fd_ = -1;
-            return false;
+            if (attempt == 16) {
+                err = "cannot take " + lock_path + ": it keeps being replaced";
+                return false;
+            }
         }
+        lock_path_ = lock_path;
         ::unlink(address.c_str());  // stale: its server is gone (it held the lock)
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
@@ -303,6 +327,7 @@ private:
     std::atomic<bool> wake_pending_{false};
     int listen_fd_{-1};
     int lock_fd_{-1};
+    std::string lock_path_;
     std::string path_;
     std::unordered_map<ConnId, std::unique_ptr<Conn>> conns_;
     std::vector<ConnId> closed_;

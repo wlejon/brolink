@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -421,6 +422,17 @@ int main(int argc, char** argv) {
     paths();
     const std::string a = local_address("brolink-test", unique_name("serve"), &err);
     serve(a);
+    {
+        check::phase("a server leaves nothing behind");
+        std::error_code ec;
+        CHECK(!std::filesystem::exists(std::filesystem::symlink_status(a, ec)));
+        // POSIX: the lock file that decided ownership goes with its server.
+        CHECK(!std::filesystem::exists(std::filesystem::symlink_status(a + ".lock", ec)));
+        // And the address can be served again.
+        Server again(a);
+        bool in_use = false;
+        CHECK_MSG(again.start(err, in_use), err);
+    }
     lanes_test(local_address("brolink-test", unique_name("lanes"), &err));
     children();
     proxy_failure();
