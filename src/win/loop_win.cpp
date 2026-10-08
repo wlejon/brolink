@@ -312,7 +312,9 @@ private:
             if (it == conns_.end()) continue;
             Conn& c = *it->second;
             if (c.rd.pending || c.wr.pending) continue;
-            DisconnectNamedPipe(c.h);
+            // CloseHandle, not DisconnectNamedPipe first: that would discard
+            // what the client has not read yet (a last Error, say), while a
+            // closed handle lets the client read it and then see the end.
             CloseHandle(c.h);
             conns_.erase(it);
         }

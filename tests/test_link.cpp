@@ -36,6 +36,7 @@ enum Msg : uint16_t {
     Data = 5,     // echoed on the same connection; also Seen on the control lane when on a lane
     Seen = 6,     // str lane, str data
     Bulk = 7,     // varint n -> a Data of n bytes
+    Last = 8,     // varint n -> a Data of n bytes, then the server closes (flushing first)
 };
 
 class Server final : public LoopHandler {
@@ -117,11 +118,14 @@ private:
                 }
                 return;
             }
-            case Bulk: {
+            case Bulk:
+            case Last: {
                 const uint64_t n = r.varint();
                 std::string body(size_t(n), '\0');
                 for (size_t i = 0; i < body.size(); ++i) body[i] = char(i * 131 + 7);
-                return send(id, Data, body);
+                send(id, Data, body);
+                if (type == Last) loop_->close(id, true);
+                return;
             }
         }
     }
@@ -228,6 +232,24 @@ void serve(const std::string& address) {
         for (size_t i = 0; same && i < body.size(); i += 4093) same = body[i] == char(i * 131 + 7);
         CHECK(same);
         CHECK(server.max_pending() > 0);  // the loop queued what the pipe could not take at once
+    }
+
+    check::phase("last words");
+    for (uint64_t size : {uint64_t(10), uint64_t(3u << 20)}) {
+        // What the server wrote before closing arrives whole, then the end.
+        Peer p;
+        p.s = connect_local(address, &err);
+        CHECK(p.s != nullptr);
+        if (!p.s) break;
+        wire::Writer w;
+        w.varint(size);
+        CHECK(p.send(Last, w.data()));
+        // Read only after the server has had time to close its end.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        uint16_t t = 0;
+        std::string body;
+        CHECK(p.next(t, body) && t == Data && body.size() == size);
+        CHECK(!p.next(t, body));
     }
 
     check::phase("peer close");
