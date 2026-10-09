@@ -10,7 +10,10 @@ namespace brolink {
 namespace {
 
 // Overlapped named-pipe client. read() and write() each wait on their own
-// event plus a shared stop event, so shutdown() unblocks either.
+// event plus a shared stop event, so shutdown() unblocks either. shutdown()
+// also closes the pipe, so the server sees the connection end as it does on
+// POSIX: at once when no I/O is in flight, else when the last read or write
+// in flight has been cancelled and returns (never under a thread using it).
 class PipeStream final : public Stream {
 public:
     explicit PipeStream(HANDLE h) : h_(h) {
@@ -20,14 +23,14 @@ public:
     }
     ~PipeStream() override {
         shutdown();
-        CloseHandle(h_);
         CloseHandle(stop_);
         CloseHandle(rd_ev_);
         CloseHandle(wr_ev_);
     }
 
     size_t read(char* buf, size_t n) override {
-        if (stopped_) return 0;
+        Op op(*this);
+        if (!op) return 0;
         OVERLAPPED ov{};
         ov.hEvent = rd_ev_;
         ResetEvent(rd_ev_);
@@ -41,6 +44,8 @@ public:
     }
 
     bool write(std::string_view data) override {
+        Op op(*this);
+        if (!op) return false;
         while (!data.empty()) {
             if (stopped_) return false;
             OVERLAPPED ov{};
@@ -59,11 +64,42 @@ public:
     }
 
     void shutdown() override {
+        std::lock_guard<std::mutex> lk(m_);
         stopped_ = true;
         SetEvent(stop_);
+        close_if_idle();
     }
 
 private:
+    // A read or write in flight: holds the pipe open until it returns.
+    class Op {
+    public:
+        explicit Op(PipeStream& s) : s_(s) {
+            std::lock_guard<std::mutex> lk(s_.m_);
+            ok_ = !s_.stopped_ && s_.h_ != INVALID_HANDLE_VALUE;
+            if (ok_) ++s_.inflight_;
+        }
+        ~Op() {
+            if (!ok_) return;
+            std::lock_guard<std::mutex> lk(s_.m_);
+            --s_.inflight_;
+            s_.close_if_idle();
+        }
+        explicit operator bool() const { return ok_; }
+
+    private:
+        PipeStream& s_;
+        bool ok_ = false;
+    };
+
+    // Under m_.
+    void close_if_idle() {
+        if (stopped_ && inflight_ == 0 && h_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(h_);
+            h_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
     // Wait for `ov` or the stop event; on stop, cancel and reap the I/O.
     bool wait(OVERLAPPED& ov) {
         HANDLE hs[2] = {ov.hEvent, stop_};
@@ -80,6 +116,8 @@ private:
     HANDLE rd_ev_;
     HANDLE wr_ev_;
     std::atomic<bool> stopped_{false};
+    std::mutex m_;
+    int inflight_ = 0;
 };
 
 // Synchronous handles (this process's stdin / stdout).

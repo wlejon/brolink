@@ -253,6 +253,26 @@ void serve(const std::string& address) {
         CHECK(!p.next(t, body));
     }
 
+    check::phase("shutdown closes");
+    {
+        // shutdown() alone, with the stream still alive, ends the connection:
+        // the server sees it go, and the stream refuses further I/O.
+        const size_t before = server.connections();
+        peers[0].s->shutdown();
+        for (int i = 0; i < 100 && server.connections() != before - 1; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK(server.connections() == before - 1);
+        char buf[16];
+        CHECK(peers[0].s->read(buf, sizeof buf) == 0);
+        CHECK(!peers[0].send(Data, "after"));
+        peers[0].s->shutdown();  // idempotent
+        // The others are untouched.
+        uint16_t t = 0;
+        std::string body;
+        CHECK(peers[1].send(Data, "still"));
+        CHECK(peers[1].next(t, body) && t == Data && body == "still");
+    }
+
     check::phase("peer close");
     peers.clear();
     for (int i = 0; i < 100 && server.connections() != 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
