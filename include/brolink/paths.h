@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace brolink {
 
@@ -29,6 +30,13 @@ namespace brolink {
 // path or a pipe name), creating the private directory a socket lives in.
 // Empty on failure (`err` says why).
 [[nodiscard]] std::string local_address(std::string_view app, std::string_view name, std::string* err = nullptr);
+
+// The endpoint names of application `app` this user has now, sorted: on
+// POSIX the sockets in its directory (one left by a server that died stays
+// until the next server binds there, so connect to tell the live ones), on
+// Windows the pipes its servers have open (a pipe goes with its server).
+// For a client that finds servers by name; empty when there are none.
+[[nodiscard]] std::vector<std::string> list_local(std::string_view app);
 
 // A per-user directory for the application's files (logs): the socket
 // directory on POSIX, %LOCALAPPDATA%\<app> on Windows. Created if missing.

@@ -1,9 +1,11 @@
 #include "brolink/paths.h"
 #include "posix_util.h"
 
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
 
@@ -76,6 +78,27 @@ std::string local_address(std::string_view app, std::string_view name, std::stri
 }
 
 std::string runtime_dir(std::string_view app, std::string* err) { return base_dir(app, err); }
+
+std::vector<std::string> list_local(std::string_view app) {
+    std::vector<std::string> names;
+    const std::string dir = base_dir(app, nullptr);
+    if (dir.empty()) return names;
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return names;
+    while (dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() <= 5 || n.compare(n.size() - 5, 5, ".sock") != 0) continue;
+        std::string name = n.substr(0, n.size() - 5);
+        if (!valid_name(name)) continue;
+        struct stat st {};
+        if (::lstat((dir + "/" + n).c_str(), &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
+        names.push_back(std::move(name));
+    }
+    ::closedir(d);
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
 
 std::string current_executable() {
 #if defined(__APPLE__)

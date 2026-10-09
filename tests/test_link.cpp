@@ -460,6 +460,30 @@ int main(int argc, char** argv) {
     const std::string a = local_address("brolink-test", unique_name("serve"), &err);
     serve(a);
     {
+        check::phase("list_local names the servers that are up");
+        auto listed = [](const std::string& name) {
+            const auto names = list_local("brolink-test");
+            return std::find(names.begin(), names.end(), name) != names.end();
+        };
+        const std::string name = unique_name("listed");
+        CHECK(!listed(name));
+        {
+            Server s(local_address("brolink-test", name, &err));
+            bool in_use = false;
+            CHECK_MSG(s.start(err, in_use), err);
+            CHECK_MSG(listed(name), "a serving endpoint is listed: " + name);
+            // Several clients at once (Windows: several pipe instances) list it once.
+            auto c1 = connect_local(local_address("brolink-test", name), &err);
+            auto c2 = connect_local(local_address("brolink-test", name), &err);
+            CHECK(c1 && c2);
+            const auto names = list_local("brolink-test");
+            CHECK(std::count(names.begin(), names.end(), name) == 1);
+            CHECK(std::is_sorted(names.begin(), names.end()));
+        }
+        CHECK_MSG(!listed(name), "a stopped server is not: " + name);
+        CHECK(list_local("bad/app").empty());
+    }
+    {
         check::phase("a server leaves nothing behind");
         std::error_code ec;
         CHECK(!std::filesystem::exists(std::filesystem::symlink_status(a, ec)));

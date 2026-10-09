@@ -3,6 +3,7 @@
 
 #include <sddl.h>
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace brolink {
@@ -36,6 +37,30 @@ std::string local_address(std::string_view app, std::string_view name, std::stri
         return {};
     }
     return "\\\\.\\pipe\\" + std::string(app) + "-" + sid + "-" + std::string(name);
+}
+
+std::vector<std::string> list_local(std::string_view app) {
+    std::vector<std::string> names;
+    if (!valid_name(app)) return names;
+    const std::string sid = user_sid_string();
+    if (sid.empty()) return names;
+    // The pipe namespace lists every pipe open on the machine; ours are
+    // <app>-<SID>-<name> (local_address).
+    const std::wstring prefix = win::to_wide(std::string(app) + "-" + sid + "-");
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(L"\\\\.\\pipe\\*", &fd);
+    if (h == INVALID_HANDLE_VALUE) return names;
+    do {
+        const std::wstring_view n(fd.cFileName);
+        if (n.size() <= prefix.size() || n.compare(0, prefix.size(), prefix) != 0) continue;
+        std::string name = win::to_utf8(n.substr(prefix.size()));
+        if (valid_name(name)) names.push_back(std::move(name));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(names.begin(), names.end());
+    // A pipe with several instances is listed once per instance.
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
 }
 
 std::string runtime_dir(std::string_view app, std::string* err) {

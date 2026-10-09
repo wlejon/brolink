@@ -11,7 +11,7 @@ only, no dependencies. MIT.
 | Header | What |
 |--------|------|
 | `brolink/wire.h` | `Writer` / `Reader` (LE fixed-width, LEB128 `varint`, zigzag `svarint`, `f32`, `str`, `bytes`, every read bounds-checked), `frame_message` / `make_message`, `MessageSplitter` (u32 length + u16 type framing, a per-protocol maximum) |
-| `brolink/paths.h` | `local_address(app, name)`: where a server listens; `runtime_dir(app)`, `valid_name`, `current_executable`, `current_pid`, `unix_time_ms` |
+| `brolink/paths.h` | `local_address(app, name)`: where a server listens; `list_local(app)`: the endpoints this user has up; `runtime_dir(app)`, `valid_name`, `current_executable`, `current_pid`, `unix_time_ms` |
 | `brolink/loop.h` | `EventLoop` + `LoopHandler`: the server side. A listener and nonblocking connections, callbacks on the thread calling `run_once`, queued writes, `pending_output` for the caller's own flow control, `wake()` from any thread |
 | `brolink/stream.h` | `Stream` (blocking read / write / shutdown from any thread); `connect_local`, `spawn_stream` (a child's stdio, how ssh runs), `stdio_stream`, `spawn_detached`, `Process` |
 | `brolink/proxy.h` | `run_proxy` / `relay`: stdio to a local server; pty mode (`ssh -tt`: a raw, binary-clean terminal, then a ready marker) and `await_ready` for the client side |
