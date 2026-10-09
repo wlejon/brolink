@@ -2,10 +2,13 @@
 // a self-pipe for wake(). A `<socket>.lock` file held with flock() decides
 // which server owns the address, so a stale socket left by a crashed server
 // is reclaimed and two servers never fight over one. A server removes both
-// files when it goes; a crashed one leaves them for the next to reclaim.
+// files when it goes; a crashed one leaves them for the next to reclaim, and
+// any server binding in the same directory sweeps the files of every dead
+// one there (a killed server with a one-off name is never bound again).
 #include "brolink/loop.h"
 #include "posix_util.h"
 
+#include <dirent.h>
 #include <poll.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -23,6 +26,58 @@ namespace {
 constexpr size_t kReadSize = 64u << 10;
 constexpr size_t kReadPerTurn = 1u << 20;  // per connection per turn
 constexpr auto kFlushTimeout = std::chrono::seconds(2);
+
+// Every `<x>.sock.lock` in `dir` whose lock can be taken belongs to a server
+// that is gone (a live one holds it for as long as it serves): its socket and
+// lock file go. The lock is held while they are removed, and taken only on
+// the file still at the path, so a server starting at that address meanwhile
+// either owns it already (the lock fails) or retries on a fresh file (its own
+// inode check in listen()). A socket with no lock file beside it predates
+// the locks (every brolink server takes its lock before it binds): it goes
+// when nothing answers on it.
+void sweep_dead_servers(const std::string& dir, const std::string& except_lock) {
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return;
+    auto ends_with = [](const std::string& s, const char* suffix) {
+        const size_t n = std::strlen(suffix);
+        return s.size() > n && s.compare(s.size() - n, n, suffix) == 0;
+    };
+    std::vector<std::string> locks, socks;
+    while (dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (ends_with(n, ".sock.lock")) locks.push_back(dir + "/" + n);
+        else if (ends_with(n, ".sock")) socks.push_back(dir + "/" + n);
+    }
+    ::closedir(d);
+    for (const std::string& sock : socks) {
+        struct stat st{};
+        if (::lstat((sock + ".lock").c_str(), &st) == 0) continue;
+        if (::lstat(sock.c_str(), &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
+        sockaddr_un sa{};
+        if (sock.size() >= sizeof sa.sun_path) continue;
+        sa.sun_family = AF_UNIX;
+        std::memcpy(sa.sun_path, sock.c_str(), sock.size() + 1);
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        const bool refused = ::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof sa) != 0 && errno == ECONNREFUSED;
+        ::close(fd);
+        if (refused) ::unlink(sock.c_str());
+    }
+    for (const std::string& lock : locks) {
+        if (lock == except_lock) continue;
+        const int fd = ::open(lock.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) continue;
+        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+            struct stat held{}, named{};
+            if (::fstat(fd, &held) == 0 && ::stat(lock.c_str(), &named) == 0 && held.st_dev == named.st_dev &&
+                held.st_ino == named.st_ino) {
+                ::unlink(lock.substr(0, lock.size() - 5).c_str());  // the socket
+                ::unlink(lock.c_str());
+            }
+        }
+        ::close(fd);
+    }
+}
 
 class PosixLoop final : public EventLoop {
 public:
@@ -95,6 +150,8 @@ public:
         }
         lock_path_ = lock_path;
         ::unlink(address.c_str());  // stale: its server is gone (it held the lock)
+        if (const size_t slash = address.rfind('/'); slash != std::string::npos && slash > 0)
+            sweep_dead_servers(address.substr(0, slash), lock_path);
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
             err = "socket: " + posix::errno_text(errno);

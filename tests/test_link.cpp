@@ -14,11 +14,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <thread>
+
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 
 using namespace brolink;
 
@@ -421,6 +428,16 @@ int child(int argc, char** argv) {
         std::fprintf(stderr, "exiting with %s\n", argv[2]);
         return std::atoi(argv[2]);
     }
+#if !defined(_WIN32)
+    if (mode == "serve-and-die" && argc > 2) {
+        // A server killed while serving: its socket and lock file stay.
+        Server s(argv[2]);
+        std::string err;
+        bool in_use = false;
+        if (!s.start(err, in_use)) return 3;
+        ::raise(SIGKILL);
+    }
+#endif
     if (mode == "proxy" && argc > 2) {
         const std::string address = argv[2];
         ProxyOptions opt;
@@ -453,6 +470,43 @@ int main(int argc, char** argv) {
         bool in_use = false;
         CHECK_MSG(again.start(err, in_use), err);
     }
+#if !defined(_WIN32)
+    {
+        check::phase("a server sweeps the files of dead servers in its directory");
+        std::error_code ec;
+        auto there = [&](const std::string& p) { return std::filesystem::exists(std::filesystem::symlink_status(p, ec)); };
+        const std::string dead = local_address("brolink-test", unique_name("killed"), &err);
+        auto p = Process::spawn({g_self, "serve-and-die", dead}, &err);
+        int code = 0;
+        CHECK(p && p->wait_for(std::chrono::seconds(30), &code));
+        CHECK_MSG(there(dead) && there(dead + ".lock"), "a killed server leaves its socket and lock: " + dead);
+        // A socket from before the lock files: bound, never listened, closed.
+        const std::string old = local_address("brolink-test", unique_name("old"), &err);
+        {
+            sockaddr_un sa{};
+            sa.sun_family = AF_UNIX;
+            std::memcpy(sa.sun_path, old.c_str(), old.size() + 1);
+            const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            CHECK(fd >= 0 && ::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof sa) == 0);
+            ::close(fd);
+        }
+        CHECK_MSG(there(old), "an old server's socket: " + old);
+        // A live server elsewhere in the directory keeps its files.
+        const std::string live_path = local_address("brolink-test", unique_name("live"), &err);
+        Server live(live_path);
+        bool in_use = false;
+        CHECK_MSG(live.start(err, in_use), err);
+        // Another server binding (at a name of its own) sweeps the dead one's.
+        const std::string next = local_address("brolink-test", unique_name("next"), &err);
+        Server s(next);
+        CHECK_MSG(s.start(err, in_use), err);
+        CHECK_MSG(!there(dead), "the dead server's socket is gone: " + dead);
+        CHECK_MSG(!there(dead + ".lock"), "and its lock file");
+        CHECK_MSG(!there(old), "a lock-less socket nothing answers on is gone: " + old);
+        CHECK(there(next) && there(next + ".lock"));
+        CHECK_MSG(there(live_path) && there(live_path + ".lock"), "a live server's files stay: " + live_path);
+    }
+#endif
     lanes_test(local_address("brolink-test", unique_name("lanes"), &err));
     children();
     proxy_failure();
