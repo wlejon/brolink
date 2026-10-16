@@ -60,6 +60,11 @@ public:
     virtual void run_once(int timeout_ms) = 0;
     // Number of live connections.
     [[nodiscard]] virtual size_t connections() const = 0;
+    // The process at the other end of `id`, as it was when it connected
+    // (POSIX: SO_PEERCRED / LOCAL_PEERPID; Windows: the pipe's client
+    // process); 0 when the platform cannot say or the id is not live. Loop
+    // thread (from a callback, typically on_accept). peer.h describes it.
+    [[nodiscard]] virtual uint64_t peer_pid(ConnId id) const = 0;
 
     static std::unique_ptr<EventLoop> create(LoopHandler& handler);
 };

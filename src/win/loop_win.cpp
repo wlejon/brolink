@@ -114,6 +114,11 @@ public:
         return n;
     }
 
+    uint64_t peer_pid(ConnId id) const override {
+        auto it = conns_.find(id);
+        return it == conns_.end() || it->second->dead ? 0 : it->second->peer_pid;
+    }
+
 private:
     enum class OpKind : uint8_t { Accept, Read, Write };
     struct Conn;
@@ -133,6 +138,7 @@ private:
         std::string inflight;  // being written
         bool dead{false};      // closing: no more callbacks, freed when ops finish
         bool close_requested{false};
+        uint64_t peer_pid{0};
         std::chrono::steady_clock::time_point close_deadline{};
     };
 
@@ -234,6 +240,8 @@ private:
         auto c = std::make_unique<Conn>();
         c->id = next_id_++;
         c->h = h;
+        ULONG client = 0;
+        if (GetNamedPipeClientProcessId(h, &client)) c->peer_pid = client;
         c->rd.kind = OpKind::Read;
         c->rd.conn = c.get();
         c->wr.kind = OpKind::Write;

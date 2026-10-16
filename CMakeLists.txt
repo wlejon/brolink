@@ -34,6 +34,7 @@ if(WIN32)
     list(APPEND BROLINK_SOURCES
         src/win/loop_win.cpp
         src/win/paths_win.cpp
+        src/win/peer_win.cpp
         src/win/random_win.cpp
         src/win/spawn_win.cpp
         src/win/stream_win.cpp
@@ -42,6 +43,7 @@ else()
     list(APPEND BROLINK_SOURCES
         src/posix/loop_posix.cpp
         src/posix/paths_posix.cpp
+        src/posix/peer_posix.cpp
         src/posix/random_posix.cpp
         src/posix/spawn_posix.cpp
         src/posix/stream_posix.cpp

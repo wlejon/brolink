@@ -232,6 +232,11 @@ public:
         return n;
     }
 
+    uint64_t peer_pid(ConnId id) const override {
+        auto it = conns_.find(id);
+        return it == conns_.end() || it->second->dead ? 0 : it->second->peer_pid;
+    }
+
     void run_once(int timeout_ms) override {
         notify_closed();
         fds_.clear();
@@ -280,6 +285,7 @@ private:
         size_t head{0};
         bool dead{false};
         bool close_requested{false};
+        uint64_t peer_pid{0};
         std::chrono::steady_clock::time_point close_deadline{};
     };
 
@@ -304,6 +310,7 @@ private:
             auto c = std::make_unique<Conn>();
             c->id = next_id_++;
             c->fd = fd;
+            c->peer_pid = posix::peer_pid(fd);
             ConnId id = c->id;
             conns_.emplace(id, std::move(c));
             handler_.on_accept(id);

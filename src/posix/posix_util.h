@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -15,6 +16,7 @@
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <sys/ucred.h>
+#include <sys/un.h>
 #endif
 
 namespace brolink::posix {
@@ -61,6 +63,25 @@ inline bool peer_is_us(int fd) {
     gid_t gid = 0;
     if (getpeereid(fd, &uid, &gid) != 0) return false;
     return uid == ::getuid();
+#endif
+}
+
+// The pid of the process at the other end of the Unix socket; 0 when the
+// platform does not say.
+inline uint64_t peer_pid(int fd) {
+#if defined(SO_PEERCRED)
+    struct ucred cred {};
+    socklen_t len = sizeof cred;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.pid <= 0) return 0;
+    return uint64_t(cred.pid);
+#elif defined(LOCAL_PEERPID)
+    pid_t pid = 0;
+    socklen_t len = sizeof pid;
+    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) != 0 || pid <= 0) return 0;
+    return uint64_t(pid);
+#else
+    (void)fd;
+    return 0;
 #endif
 }
 

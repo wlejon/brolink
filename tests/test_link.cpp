@@ -8,6 +8,7 @@
 #include "brolink/lanes.h"
 #include "brolink/loop.h"
 #include "brolink/paths.h"
+#include "brolink/peer.h"
 #include "brolink/proxy.h"
 #include "brolink/stream.h"
 #include "check.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -74,6 +76,7 @@ public:
     size_t max_pending() const { return max_pending_; }
 
     void on_accept(ConnId id) override {
+        last_peer_pid = loop_->peer_pid(id);
         std::lock_guard<std::mutex> lk(m_);
         ++open_;
         conns_[id];
@@ -147,6 +150,11 @@ private:
     std::mutex m_;
     size_t open_ = 0;
     std::atomic<size_t> max_pending_{0};
+
+public:
+    std::atomic<uint64_t> last_peer_pid{0};
+
+private:
 };
 
 // Blocking message reads from a client stream.
@@ -224,6 +232,23 @@ void serve(const std::string& address) {
         std::string body;
         CHECK(peers[i].next(t, body));
         CHECK(t == Data && body == "hello " + std::to_string(i));
+    }
+
+    check::phase("the peer is this process");
+    {
+        // Every client here is this process, so the loop names it.
+        CHECK_MSG(server.last_peer_pid.load() == current_pid(),
+                  "peer_pid " + std::to_string(server.last_peer_pid.load()) + " vs " + std::to_string(current_pid()));
+        const ProcessOrigin o = describe_process(current_pid());
+        CHECK(o.pid == current_pid());
+        CHECK(!o.user.empty() && o.user == current_user());
+#if defined(__linux__)
+        // An ssh-started test sees its session; a local one sees none.
+        const char* conn = std::getenv("SSH_CONNECTION");
+        CHECK_MSG(o.ssh_connection == (conn ? conn : ""), o.ssh_connection);
+        if (conn) CHECK(!o.ssh_client.empty() && std::string(conn).rfind(o.ssh_client + " ", 0) == 0);
+#endif
+        CHECK(describe_process(0).pid == 0);
     }
 
     check::phase("bulk");
