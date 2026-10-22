@@ -554,6 +554,43 @@ int main(int argc, char** argv) {
         CHECK_MSG(!there(old), "a lock-less socket nothing answers on is gone: " + old);
         CHECK(there(next) && there(next + ".lock"));
         CHECK_MSG(there(live_path) && there(live_path + ".lock"), "a live server's files stay: " + live_path);
+
+        // Re-listening on the same EventLoop cleans up the previous socket and lock.
+        struct DummyHandler final : LoopHandler {
+            ConnId last_accept{0};
+            ConnId last_closed{0};
+            void on_accept(ConnId id) override { last_accept = id; }
+            void on_data(ConnId, const char*, size_t) override {}
+            void on_closed(ConnId id) override { last_closed = id; }
+        } dh;
+        auto loop = EventLoop::create(dh);
+        const std::string addr1 = local_address("brolink-test", unique_name("relisten1"), &err);
+        const std::string addr2 = local_address("brolink-test", unique_name("relisten2"), &err);
+        CHECK(loop->listen(addr1, err, in_use));
+        CHECK(there(addr1) && there(addr1 + ".lock"));
+        CHECK(loop->listen(addr2, err, in_use));
+        CHECK(!there(addr1) && !there(addr1 + ".lock"));
+        CHECK(there(addr2) && there(addr2 + ".lock"));
+
+        // close(id, true) rejects subsequent writes and clamps run_once(-1) to the flush deadline.
+        auto stalled = connect_local(addr2, &err);
+        CHECK(stalled != nullptr);
+        loop->run_once(100);
+        CHECK(dh.last_accept != 0);
+        const ConnId cid = dh.last_accept;
+        std::string huge(16u << 20, 'z');
+        loop->write(cid, huge);
+        const size_t queued_before = loop->pending_output(cid);
+        CHECK(queued_before > 0);
+        loop->close(cid, true);
+        loop->write(cid, "rejected-after-close");
+        CHECK(loop->pending_output(cid) == queued_before);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (dh.last_closed != cid &&
+               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+            loop->run_once(-1);
+        }
+        CHECK(dh.last_closed == cid);
     }
 #endif
     lanes_test(local_address("brolink-test", unique_name("lanes"), &err));

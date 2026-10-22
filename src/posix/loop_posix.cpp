@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <unordered_map>
 #include <vector>
 
@@ -98,19 +99,15 @@ public:
         close_listener();
         for (auto& [id, c] : conns_) ::close(c->fd);
         conns_.clear();
-        if (lock_fd_ >= 0) {
-            // Still holding the lock, so the file is ours to remove. One
-            // opened by a server starting meanwhile is rejected there
-            // (listen() checks the lock it takes is on the file at the path).
-            ::unlink(lock_path_.c_str());
-            ::close(lock_fd_);
-        }
+        release_lock();
         if (wake_r_ >= 0) ::close(wake_r_);
         if (wake_w_ >= 0) ::close(wake_w_);
     }
 
     bool listen(const std::string& address, std::string& err, bool& in_use) override {
         in_use = false;
+        close_listener();
+        release_lock();
         sockaddr_un sa{};
         sa.sun_family = AF_UNIX;
         if (address.size() >= sizeof sa.sun_path) {
@@ -155,12 +152,14 @@ public:
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
             err = "socket: " + posix::errno_text(errno);
+            release_lock();
             return false;
         }
         posix::set_cloexec(fd);
         if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof sa) != 0) {
             err = "cannot bind " + address + ": " + posix::errno_text(errno);
             ::close(fd);
+            release_lock();
             return false;
         }
         ::chmod(address.c_str(), 0600);
@@ -168,6 +167,7 @@ public:
             err = "listen: " + posix::errno_text(errno);
             ::close(fd);
             ::unlink(address.c_str());
+            release_lock();
             return false;
         }
         listen_fd_ = fd;
@@ -185,7 +185,7 @@ public:
 
     void write(ConnId id, std::string_view data) override {
         Conn* c = find(id);
-        if (!c || c->dead || data.empty()) return;
+        if (!c || c->dead || c->close_requested || data.empty()) return;
         if (c->out.size() == c->head) {
             // Nothing queued: try the socket directly.
             ssize_t r = ::send(c->fd, data.data(), data.size(), posix::send_flags());
@@ -211,8 +211,10 @@ public:
         Conn* c = find(id);
         if (!c || c->dead) return;
         if (flush_first && c->out.size() > c->head) {
-            c->close_requested = true;
-            c->close_deadline = std::chrono::steady_clock::now() + kFlushTimeout;
+            if (!c->close_requested) {
+                c->close_requested = true;
+                c->close_deadline = std::chrono::steady_clock::now() + kFlushTimeout;
+            }
             return;
         }
         begin_close(*c);
@@ -248,20 +250,36 @@ public:
             ids_.push_back(0);
         }
         const size_t first_conn = fds_.size();
+        bool has_deadline = false;
+        std::chrono::steady_clock::time_point earliest_deadline{};
         for (auto& [id, c] : conns_) {
             if (c->dead) continue;
             short ev = POLLIN;
             if (c->out.size() > c->head) ev |= POLLOUT;
             fds_.push_back(pollfd{c->fd, ev, 0});
             ids_.push_back(id);
+            if (c->close_requested && (!has_deadline || c->close_deadline < earliest_deadline)) {
+                earliest_deadline = c->close_deadline;
+                has_deadline = true;
+            }
         }
-        int r = ::poll(fds_.data(), nfds_t(fds_.size()), timeout_ms);
+        int poll_timeout = timeout_ms;
+        if (has_deadline && poll_timeout != 0) {
+            const auto now = std::chrono::steady_clock::now();
+            int64_t rem_ms = 0;
+            if (earliest_deadline > now) {
+                rem_ms = std::chrono::ceil<std::chrono::milliseconds>(earliest_deadline - now).count();
+            }
+            const int clamped = rem_ms > INT_MAX ? INT_MAX : static_cast<int>(rem_ms);
+            if (poll_timeout < 0 || clamped < poll_timeout) poll_timeout = clamped;
+        }
+        int r = ::poll(fds_.data(), nfds_t(fds_.size()), poll_timeout);
         if (r > 0) {
             if (fds_[0].revents) {
+                wake_pending_ = false;
                 char b[64];
                 while (::read(wake_r_, b, sizeof b) > 0) {
                 }
-                wake_pending_ = false;
             }
             if (listen_fd_ >= 0 && first_conn == 2 && fds_[1].revents) accept_all();
             for (size_t i = first_conn; i < fds_.size(); ++i) {
@@ -278,6 +296,17 @@ public:
     }
 
 private:
+    void release_lock() {
+        if (lock_fd_ >= 0) {
+            // Still holding the lock, so the file is ours to remove. One
+            // opened by a server starting meanwhile is rejected there
+            // (listen() checks the lock it takes is on the file at the path).
+            if (!lock_path_.empty()) ::unlink(lock_path_.c_str());
+            ::close(lock_fd_);
+            lock_fd_ = -1;
+            lock_path_.clear();
+        }
+    }
     struct Conn {
         ConnId id{0};
         int fd{-1};
