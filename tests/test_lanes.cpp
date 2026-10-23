@@ -104,6 +104,139 @@ void registry() {
     CHECK(reg.closed(999).empty());
 }
 
+void model_check_lanes_and_hol_isolation() {
+    check::phase("exhaustive lane registry & HOL-blocking isolation model check");
+
+    // 1. Exhaustive state-space model check over all 5! = 120 action orderings of
+    //    session lifecycle transitions (join input, join video, replay input, close input, close control)
+    //    interleaved with a second concurrent session.
+    enum Action {
+        kJoinInput = 0,
+        kJoinVideo = 1,
+        kReplayInput = 2,
+        kCloseInput = 3,
+        kCloseControl = 4,
+    };
+    std::vector<Action> perm = {kJoinInput, kJoinVideo, kReplayInput, kCloseInput, kCloseControl};
+    int schedules = 0;
+    do {
+        ++schedules;
+        Registry reg;
+        auto g1 = reg.open(100);
+        auto g2 = reg.open(200);
+        CHECK(g1.has_value() && g2.has_value());
+        CHECK(reg.join(201, Join{g2->session, g2->token, "input"}) == JoinResult::Joined);
+
+        bool s1Alive = true;
+        bool inputUsed = false;
+        bool inputLive = false;
+        bool videoLive = false;
+
+        for (Action act : perm) {
+            switch (act) {
+                case kJoinInput: {
+                    JoinResult r = reg.join(101, Join{g1->session, g1->token, "input"});
+                    if (!s1Alive) {
+                        CHECK(r == JoinResult::NoSession);
+                    } else if (inputLive) {
+                        CHECK(r == JoinResult::Already);
+                    } else if (inputUsed) {
+                        CHECK(r == JoinResult::LaneTaken);
+                    } else {
+                        CHECK(r == JoinResult::Joined);
+                        inputUsed = true;
+                        inputLive = true;
+                    }
+                    break;
+                }
+                case kJoinVideo: {
+                    JoinResult r = reg.join(102, Join{g1->session, g1->token, "video"});
+                    if (!s1Alive) {
+                        CHECK(r == JoinResult::NoSession);
+                    } else {
+                        CHECK(r == JoinResult::Joined);
+                        videoLive = true;
+                    }
+                    break;
+                }
+                case kReplayInput: {
+                    JoinResult r = reg.join(103, Join{g1->session, g1->token, "input"});
+                    if (!s1Alive) {
+                        CHECK(r == JoinResult::NoSession);
+                    } else if (inputUsed) {
+                        CHECK(r == JoinResult::LaneTaken);
+                    } else {
+                        CHECK(r == JoinResult::Joined);
+                        inputUsed = true;
+                        // Connection 103 took "input" before 101 tried
+                        auto closed = reg.closed(103);
+                        CHECK(closed.empty());
+                    }
+                    break;
+                }
+                case kCloseInput: {
+                    auto closed = reg.closed(101);
+                    CHECK(closed.empty());
+                    inputLive = false;
+                    break;
+                }
+                case kCloseControl: {
+                    auto closed = reg.closed(100);
+                    size_t expected = (inputLive ? 1u : 0u) + (videoLive ? 1u : 0u);
+                    CHECK(closed.size() == expected);
+                    s1Alive = false;
+                    inputLive = false;
+                    videoLive = false;
+                    break;
+                }
+            }
+
+            // Relational invariants at every state:
+            // Session 2 must remain completely unaffected by any transition in Session 1.
+            CHECK(reg.control(g2->session) == ConnId(200));
+            CHECK(reg.lane(g2->session, "input") == ConnId(201));
+            CHECK(reg.sessions() == (s1Alive ? 2u : 1u));
+            if (s1Alive) {
+                CHECK(reg.control(g1->session) == ConnId(100));
+                CHECK(reg.lane(g1->session, "input") == (inputLive ? std::optional<ConnId>(101) : std::nullopt));
+                CHECK(reg.lane(g1->session, "video") == (videoLive ? std::optional<ConnId>(102) : std::nullopt));
+            } else {
+                CHECK(!reg.control(g1->session).has_value());
+                CHECK(!reg.member(100) && !reg.member(101) && !reg.member(102));
+            }
+        }
+    } while (std::next_permutation(perm.begin(), perm.end()));
+    CHECK(schedules == 120);
+
+    // 2. Multi-lane HOL-blocking isolation: a stalled partial bulk frame on the
+    //    `video` lane never blocks or corrupts interleaved 1-byte / chunked
+    //    frames on the `input` and `control` lanes.
+    wire::MessageSplitter controlSp, inputSp, videoSp;
+    std::string videoFrame = wire::make_message(0x30, std::string(4096, 'V'));
+    // Feed only the first 19 bytes of the 4KB video frame (stalled mid-frame)
+    videoSp.feed(videoFrame.data(), 19);
+    wire::MessageSplitter::Message msg;
+    CHECK(!videoSp.next(msg) && !videoSp.error());
+
+    for (uint16_t seq = 1; seq <= 32; ++seq) {
+        std::string inMsg = wire::make_message(seq, "key:" + std::to_string(seq));
+        std::string ctlMsg = wire::make_message(uint16_t(0x100 + seq), "ping");
+        // Interleave 1 byte at a time across input, control, and 1 byte of stalled video
+        size_t maxLen = std::max(inMsg.size(), ctlMsg.size());
+        for (size_t i = 0; i < maxLen; ++i) {
+            if (i < inMsg.size()) inputSp.feed(&inMsg[i], 1);
+            if (i < ctlMsg.size()) controlSp.feed(&ctlMsg[i], 1);
+        }
+        CHECK(inputSp.next(msg) && msg.type == seq && msg.payload == "key:" + std::to_string(seq));
+        CHECK(controlSp.next(msg) && msg.type == uint16_t(0x100 + seq) && msg.payload == "ping");
+        CHECK(!videoSp.next(msg) && !videoSp.error());
+    }
+    // Finally complete the stalled video frame and verify it delivers intact.
+    videoSp.feed(videoFrame.data() + 19, videoFrame.size() - 19);
+    CHECK(videoSp.next(msg) && msg.type == 0x30 && msg.payload.size() == 4096);
+    CHECK(!videoSp.error() && videoSp.buffered() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -111,5 +244,6 @@ int main() {
     tokens();
     bodies();
     registry();
+    model_check_lanes_and_hol_isolation();
     return check::finish("test_lanes");
 }
