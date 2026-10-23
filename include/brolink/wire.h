@@ -153,7 +153,7 @@ public:
     uint32_t varint32() { return uint32_t(varint_max(0xFFFFFFFFu)); }
     int64_t svarint() {
         uint64_t v = varint();
-        return int64_t(v >> 1) ^ -int64_t(v & 1);
+        return static_cast<int64_t>((v >> 1) ^ (0ULL - (v & 1)));
     }
     // An svarint that must fit an int32.
     int32_t svarint32() {
@@ -203,7 +203,8 @@ public:
     size_t count(size_t min_bytes = 1) {
         uint64_t n = varint();
         if (!ok_) return 0;
-        if (min_bytes && n > remaining() / min_bytes) {
+        const size_t step = min_bytes ? min_bytes : 1;
+        if (n > remaining() / step) {
             ok_ = false;
             return 0;
         }
@@ -211,7 +212,10 @@ public:
     }
     std::vector<std::string> strings() {
         std::vector<std::string> v(count());
-        for (std::string& s : v) s = str();
+        for (std::string& s : v) {
+            s = str();
+            if (!ok_) break;
+        }
         if (!ok_) v.clear();
         return v;
     }
@@ -220,6 +224,7 @@ public:
         for (auto& [k, val] : v) {
             k = str();
             val = str();
+            if (!ok_) break;
         }
         if (!ok_) v.clear();
         return v;

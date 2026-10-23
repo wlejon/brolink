@@ -39,7 +39,7 @@ bool MessageSplitter::next(Message& m) {
         error_ = true;
         return false;
     }
-    if (avail < kLengthBytes + len) return false;
+    if (avail - kLengthBytes < len) return false;
     m.type = uint16_t(p[4] | (p[5] << 8));
     m.payload = std::string_view(buf_.data() + head_ + kHeaderBytes, len - 2);
     // The bytes stay put until the next feed() (which compacts), so the view
